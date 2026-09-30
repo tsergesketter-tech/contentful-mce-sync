@@ -1,0 +1,123 @@
+{
+  "functions": [
+    {
+      "id": "createDataExtension",
+      "name": "Create Data Extension",
+      "description": "Derives a Data Extension schema from a Contentful content type and creates it synchronously in Marketing Cloud Engagement via SOAP CreateRequest.",
+      "path": "functions/createDataExtension.js",
+      "entryFile": "functions/createDataExtension.ts",
+      "allowNetworks": [
+        "YOUR_SUBDOMAIN.soap.marketingcloudapis.com",
+        "YOUR_SUBDOMAIN.auth.marketingcloudapis.com"
+      ],
+      "accepts": [
+        "appaction.call"
+      ]
+    },
+    {
+      "id": "backfillDeRows",
+      "name": "Backfill Data Extension Rows",
+      "description": "Copies every already-published entry of a content type into a linked Data Extension via the Data Extension Rows (Synchronous) REST rowset upsert endpoint.",
+      "path": "functions/backfillDeRows.js",
+      "entryFile": "functions/backfillDeRows.ts",
+      "allowNetworks": [
+        "YOUR_SUBDOMAIN.rest.marketingcloudapis.com",
+        "YOUR_SUBDOMAIN.auth.marketingcloudapis.com"
+      ],
+      "accepts": [
+        "appaction.call"
+      ]
+    },
+    {
+      "id": "paloniaEngagementSync",
+      "name": "Publish -> Marketing Cloud Engagement Sync",
+      "description": "On Entry.publish/unpublish/delete for any content type with an active deSyncLinkage: authenticates to Marketing Cloud Engagement and upserts the linked Data Extension's rows.",
+      "path": "functions/paloniaEngagementSync.js",
+      "entryFile": "functions/paloniaEngagementSync.ts",
+      "allowNetworks": [
+        "YOUR_SUBDOMAIN.rest.marketingcloudapis.com",
+        "YOUR_SUBDOMAIN.auth.marketingcloudapis.com",
+        "cdn.contentful.com"
+      ],
+      "accepts": [
+        "appevent.handler"
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "createDataExtension",
+      "name": "Create Data Extension",
+      "description": "Creates a brand-new Data Extension from a Contentful content type's fields.",
+      "type": "function-invocation",
+      "functionId": "createDataExtension",
+      "category": "Custom",
+      "parameters": [
+        {
+          "id": "contentTypeId",
+          "name": "Content Type Id",
+          "type": "Symbol",
+          "required": true
+        },
+        {
+          "id": "deExternalKey",
+          "name": "DE External Key (optional override)",
+          "type": "Symbol",
+          "required": false
+        },
+        {
+          "id": "deLabel",
+          "name": "DE Name (optional override)",
+          "type": "Symbol",
+          "required": false
+        },
+        {
+          "id": "excludedFieldIds",
+          "name": "Excluded content-type field ids (comma-separated)",
+          "type": "Symbol",
+          "required": false
+        },
+        {
+          "id": "extraFieldLabels",
+          "name": "Extra field labels (comma-separated)",
+          "type": "Symbol",
+          "required": false
+        }
+      ]
+    },
+    {
+      "id": "backfillDeRows",
+      "name": "Backfill Data Extension Rows",
+      "description": "Copies every already-published entry of a content type into a linked Data Extension.",
+      "type": "function-invocation",
+      "functionId": "backfillDeRows",
+      "category": "Custom",
+      "parameters": [
+        {
+          "id": "contentTypeId",
+          "name": "Content Type Id",
+          "type": "Symbol",
+          "required": true
+        },
+        {
+          "id": "deExternalKey",
+          "name": "DE External Key",
+          "type": "Symbol",
+          "required": true
+        },
+        {
+          "id": "pkContentfulFieldId",
+          "name": "Business key field id (or __entryId)",
+          "type": "Symbol",
+          "required": true
+        },
+        {
+          "id": "deFieldsJson",
+          "name": "DE field map (JSON)",
+          "type": "Symbol",
+          "required": false
+        }
+      ]
+    }
+  ]
+}
