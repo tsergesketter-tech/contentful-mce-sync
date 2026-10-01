@@ -7,8 +7,8 @@
       "path": "functions/createDataExtension.js",
       "entryFile": "functions/createDataExtension.ts",
       "allowNetworks": [
-        "YOUR_SUBDOMAIN.soap.marketingcloudapis.com",
-        "YOUR_SUBDOMAIN.auth.marketingcloudapis.com"
+        "mc4k5825vb2l-5z-5wbjpbfhztk4.soap.marketingcloudapis.com",
+        "mc4k5825vb2l-5z-5wbjpbfhztk4.auth.marketingcloudapis.com"
       ],
       "accepts": [
         "appaction.call"
@@ -21,8 +21,8 @@
       "path": "functions/backfillDeRows.js",
       "entryFile": "functions/backfillDeRows.ts",
       "allowNetworks": [
-        "YOUR_SUBDOMAIN.rest.marketingcloudapis.com",
-        "YOUR_SUBDOMAIN.auth.marketingcloudapis.com"
+        "mc4k5825vb2l-5z-5wbjpbfhztk4.rest.marketingcloudapis.com",
+        "mc4k5825vb2l-5z-5wbjpbfhztk4.auth.marketingcloudapis.com"
       ],
       "accepts": [
         "appaction.call"
@@ -35,8 +35,8 @@
       "path": "functions/paloniaEngagementSync.js",
       "entryFile": "functions/paloniaEngagementSync.ts",
       "allowNetworks": [
-        "YOUR_SUBDOMAIN.rest.marketingcloudapis.com",
-        "YOUR_SUBDOMAIN.auth.marketingcloudapis.com",
+        "mc4k5825vb2l-5z-5wbjpbfhztk4.rest.marketingcloudapis.com",
+        "mc4k5825vb2l-5z-5wbjpbfhztk4.auth.marketingcloudapis.com",
         "cdn.contentful.com"
       ],
       "accepts": [
