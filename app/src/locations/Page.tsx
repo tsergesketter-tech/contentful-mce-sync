@@ -20,6 +20,12 @@ import {
   Tooltip,
 } from '@contentful/f36-components';
 import type { ContentTypeProps, EntryProps } from 'contentful-management';
+import {
+  deriveDeFieldsFromContentType,
+  type ContentTypeField,
+  type ContentTypeLike,
+  type DeField,
+} from '../../functions/lib/deFieldMapping';
 
 const REGISTRY_CONTENT_TYPE = 'dataExtensionRegistry';
 const LINKAGE_CONTENT_TYPE = 'deSyncLinkage';
@@ -109,8 +115,14 @@ async function runBackfill(
   };
 }
 
-function deFieldsOf(entry: EntryProps): unknown[] {
-  return field<{ fields: unknown[] }>(entry, 'fieldMap')?.fields ?? [];
+function deFieldsOf(entry: EntryProps): DeField[] {
+  return field<{ fields: DeField[] }>(entry, 'fieldMap')?.fields ?? [];
+}
+
+// Same eligibility rule as deriveDeFieldsFromContentType's filter — kept in sync by hand so the UI
+// checklist only ever offers fields the backend would actually derive.
+function isEligibleField(f: ContentTypeField): boolean {
+  return !f.disabled && !f.omitted && f.type !== 'Link' && f.type !== 'RichText';
 }
 
 const Page = () => {
@@ -136,9 +148,16 @@ const Page = () => {
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [createContentTypeId, setCreateContentTypeId] = useState<string>('');
   const [extraFieldLabels, setExtraFieldLabels] = useState('');
+  const [fieldSelection, setFieldSelection] = useState<Record<string, boolean>>({});
   const [deployBusy, setDeployBusy] = useState(false);
   const [deployError, setDeployError] = useState<string | null>(null);
   const [deployStatusMessage, setDeployStatusMessage] = useState<string | null>(null);
+
+  const [isEditFieldsModalOpen, setIsEditFieldsModalOpen] = useState(false);
+  const [editFieldSelection, setEditFieldSelection] = useState<Record<string, boolean>>({});
+  const [editFieldsBusy, setEditFieldsBusy] = useState(false);
+  const [editFieldsError, setEditFieldsError] = useState<string | null>(null);
+  const [editFieldsMessage, setEditFieldsMessage] = useState<string | null>(null);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -221,6 +240,14 @@ const Page = () => {
 
   const canUnlink = !!selectedContentTypeId && !!existingLinkage && existingLinkageIsActive && !busy;
   const canBackfill = !!selectedContentTypeId && !!existingLinkage && existingLinkageIsActive && !busy;
+
+  const existingRegistryEntry = useMemo(() => {
+    if (!existingLinkage || !existingLinkageIsActive) return undefined;
+    const deId = field<{ sys: { id: string } }>(existingLinkage, 'dataExtension')?.sys.id;
+    return deId ? registryById.get(deId) : undefined;
+  }, [existingLinkage, existingLinkageIsActive, registryById]);
+
+  const canEditFields = !!selectedContentTypeId && !!existingRegistryEntry && !busy;
 
   const handleLink = async () => {
     if (!selectedContentTypeId || !selectedRegistryEntryId || !selectedContentType || !sdk.ids.app) return;
@@ -336,6 +363,19 @@ const Page = () => {
     }
   };
 
+  const createContentType = contentTypes.find((ct) => ct.sys.id === createContentTypeId);
+  const createEligibleFields = useMemo(
+    () => ((createContentType?.fields ?? []) as ContentTypeField[]).filter(isEligibleField),
+    [createContentType]
+  );
+
+  useEffect(() => {
+    if (!isCreateModalOpen) return;
+    const next: Record<string, boolean> = {};
+    for (const f of createEligibleFields) next[f.id] = true;
+    setFieldSelection(next);
+  }, [isCreateModalOpen, createContentTypeId]);
+
   const openCreateModal = () => {
     setCreateContentTypeId(selectedContentTypeId ?? contentTypes[0]?.sys.id ?? '');
     setExtraFieldLabels('');
@@ -354,10 +394,12 @@ const Page = () => {
     setDeployBusy(true);
     setDeployError(null);
     try {
+      const excludedFieldIds = createEligibleFields.filter((f) => !fieldSelection[f.id]).map((f) => f.id);
       setDeployStatusMessage('Deriving schema and creating the Data Extension...');
       const createResult = await callAppAction(cma, ids, 'createDataExtension', {
         contentTypeId: createContentTypeId,
         extraFieldLabels: extraFieldLabels.trim() || undefined,
+        excludedFieldIds: excludedFieldIds.length ? excludedFieldIds.join(',') : undefined,
       });
       if (!createResult?.ok) throw new Error(createResult?.error || 'Failed to create the Data Extension.');
 
@@ -439,6 +481,67 @@ const Page = () => {
       setDeployError(e instanceof Error ? e.message : 'Failed to create the Data Extension.');
     } finally {
       setDeployBusy(false);
+    }
+  };
+
+  const openEditFieldsModal = () => {
+    if (!selectedContentType || !existingRegistryEntry) return;
+    const excluded = new Set(field<string[]>(existingRegistryEntry, 'excludedFieldIds') ?? []);
+    const next: Record<string, boolean> = {};
+    for (const f of (selectedContentType.fields as ContentTypeField[]).filter(isEligibleField)) {
+      next[f.id] = !excluded.has(f.id);
+    }
+    setEditFieldSelection(next);
+    setEditFieldsError(null);
+    setEditFieldsMessage(null);
+    setIsEditFieldsModalOpen(true);
+  };
+
+  // Preserves FIXED_FIELDS and any manually-added extra fields (identified by having no
+  // contentfulFieldId) — only the content-type-derived slice is recomputed from the checklist.
+  const handleSaveFieldSelection = async () => {
+    if (!selectedContentType || !selectedContentTypeId || !existingRegistryEntry || !existingLinkage || !sdk.ids.app) return;
+    setEditFieldsBusy(true);
+    setEditFieldsError(null);
+    setEditFieldsMessage(null);
+    try {
+      const eligibleFields = (selectedContentType.fields as ContentTypeField[]).filter(isEligibleField);
+      const excludedFieldIds = eligibleFields.filter((f) => !editFieldSelection[f.id]).map((f) => f.id);
+
+      const derivedFields = deriveDeFieldsFromContentType(selectedContentType as unknown as ContentTypeLike, excludedFieldIds);
+      const manualFields = deFieldsOf(existingRegistryEntry).filter((f) => !f.contentfulFieldId);
+      const newFieldMap = [...manualFields, ...derivedFields];
+
+      const updatedRegistry: EntryProps = {
+        ...existingRegistryEntry,
+        fields: {
+          ...existingRegistryEntry.fields,
+          fieldMap: { 'en-US': { fields: newFieldMap } },
+          excludedFieldIds: { 'en-US': excludedFieldIds },
+        },
+      };
+      const saved = await cma.entry.update({ entryId: existingRegistryEntry.sys.id }, updatedRegistry);
+      const published = await cma.entry.publish({ entryId: saved.sys.id }, saved);
+
+      const deExternalKey = field<string>(published, 'deExternalKey');
+      const pkContentfulFieldId = field<string>(existingLinkage, 'pkContentfulFieldId') ?? ENTRY_ID_SENTINEL;
+      if (deExternalKey) {
+        const ids: AppActionIds = { spaceId: sdk.ids.space, environmentId: sdk.ids.environment, appDefinitionId: sdk.ids.app };
+        const result = await runBackfill(
+          cma,
+          ids,
+          { contentTypeId: selectedContentTypeId, deExternalKey, pkContentfulFieldId, deFields: newFieldMap },
+          setEditFieldsMessage
+        );
+        setEditFieldsMessage(`Saved. Re-synced ${result.processed} row(s) from ${result.totalEntries} entrie(s).`);
+      }
+
+      await loadAll();
+      setIsEditFieldsModalOpen(false);
+    } catch (e) {
+      setEditFieldsError(e instanceof Error ? e.message : 'Failed to save field selection.');
+    } finally {
+      setEditFieldsBusy(false);
     }
   };
 
@@ -618,6 +721,11 @@ const Page = () => {
             Backfill Now
           </Button>
         </Tooltip>
+        <Tooltip content="Choose which fields sync into the linked Data Extension, then re-backfill.">
+          <Button variant="secondary" isDisabled={!canEditFields} onClick={openEditFieldsModal}>
+            Edit Fields
+          </Button>
+        </Tooltip>
       </Flex>
 
       <Modal
@@ -665,6 +773,30 @@ const Page = () => {
                   here as plain text if needed.
                 </FormControl.HelpText>
               </FormControl>
+              {createEligibleFields.length > 0 && (
+                <FormControl>
+                  <FormControl.Label>Fields to sync</FormControl.Label>
+                  <Box style={{ maxHeight: 220, overflowY: 'auto' }}>
+                    {createEligibleFields.map((f) => (
+                      <Checkbox
+                        key={f.id}
+                        id={`create-field-${f.id}`}
+                        isChecked={fieldSelection[f.id] ?? true}
+                        isDisabled={deployBusy}
+                        onChange={() =>
+                          setFieldSelection((prev) => ({ ...prev, [f.id]: !(prev[f.id] ?? true) }))
+                        }
+                      >
+                        {f.name} <Text fontColor="gray600">({f.id})</Text>
+                      </Checkbox>
+                    ))}
+                  </Box>
+                  <FormControl.HelpText>
+                    Unchecked fields are left out of the Data Extension's schema (Link and Rich
+                    Text fields aren't eligible and aren't listed here).
+                  </FormControl.HelpText>
+                </FormControl>
+              )}
               {deployStatusMessage && (
                 <Flex alignItems="center" gap="spacingXs" marginTop="spacingS">
                   {deployBusy && <Spinner size="small" />}
@@ -692,6 +824,76 @@ const Page = () => {
                 isLoading={deployBusy}
               >
                 Create &amp; Link
+              </Button>
+            </Modal.Controls>
+          </>
+        )}
+      </Modal>
+
+      <Modal
+        isShown={isEditFieldsModalOpen}
+        onClose={() => !editFieldsBusy && setIsEditFieldsModalOpen(false)}
+        size="medium"
+      >
+        {() => (
+          <>
+            <Modal.Header
+              title="Edit Synced Fields"
+              onClose={() => !editFieldsBusy && setIsEditFieldsModalOpen(false)}
+            />
+            <Modal.Content>
+              <Paragraph>
+                Choose which fields of this content type sync into the linked Data Extension.
+                Saving recomputes the field map and re-copies every already-published entry.
+                Bookkeeping columns and any manually-added extra fields are kept as-is.
+              </Paragraph>
+              {selectedContentType && (
+                <FormControl>
+                  <FormControl.Label>Fields to sync</FormControl.Label>
+                  <Box style={{ maxHeight: 260, overflowY: 'auto' }}>
+                    {(selectedContentType.fields as ContentTypeField[]).filter(isEligibleField).map((f) => (
+                      <Checkbox
+                        key={f.id}
+                        id={`edit-field-${f.id}`}
+                        isChecked={editFieldSelection[f.id] ?? true}
+                        isDisabled={editFieldsBusy}
+                        onChange={() =>
+                          setEditFieldSelection((prev) => ({ ...prev, [f.id]: !(prev[f.id] ?? true) }))
+                        }
+                      >
+                        {f.name} <Text fontColor="gray600">({f.id})</Text>
+                      </Checkbox>
+                    ))}
+                  </Box>
+                </FormControl>
+              )}
+              {editFieldsMessage && (
+                <Flex alignItems="center" gap="spacingXs" marginTop="spacingS">
+                  {editFieldsBusy && <Spinner size="small" />}
+                  <Text>{editFieldsMessage}</Text>
+                </Flex>
+              )}
+              {editFieldsError && (
+                <Box marginTop="spacingS">
+                  <Note variant="negative">{editFieldsError}</Note>
+                </Box>
+              )}
+            </Modal.Content>
+            <Modal.Controls>
+              <Button
+                variant="secondary"
+                onClick={() => setIsEditFieldsModalOpen(false)}
+                isDisabled={editFieldsBusy}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                onClick={handleSaveFieldSelection}
+                isDisabled={editFieldsBusy}
+                isLoading={editFieldsBusy}
+              >
+                Save &amp; Re-sync
               </Button>
             </Modal.Controls>
           </>
