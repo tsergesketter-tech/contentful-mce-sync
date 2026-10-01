@@ -7,7 +7,7 @@
  */
 import type { AppActionRequest, FunctionEventContext, FunctionEventHandler, FunctionTypeEnum } from '@contentful/node-apps-toolkit';
 import { readMceCreds, getMceToken } from './lib/mceAuth';
-import { createDataExtension as soapCreateDataExtension, dataExtensionExists } from './lib/mceSoap';
+import { createDataExtension as soapCreateDataExtension, dataExtensionExists, ensureDataExtensionFolder } from './lib/mceSoap';
 import {
   PK_FIELD,
   FIXED_FIELDS,
@@ -109,12 +109,20 @@ export const handler: FunctionEventHandler<FunctionTypeEnum.AppActionCall> = asy
     }
   }
 
+  let categoryId: number | undefined;
+  try {
+    categoryId = await ensureDataExtensionFolder(creds, token.accessToken, 'Contentful');
+  } catch {
+    // Folder placement is cosmetic — fall back to the account default rather than failing the sync.
+  }
+
   const result = await soapCreateDataExtension(creds, token.accessToken, {
     externalKey,
     name: externalKey,
     description: `Synced from Contentful content type "${body.contentTypeId}".`,
     pkField: PK_FIELD,
     fields: allFields,
+    categoryId,
   });
 
   if (!result.ok) {
