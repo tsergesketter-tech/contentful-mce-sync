@@ -1,176 +1,204 @@
 # Contentful → Marketing Cloud Engagement Data Extension Sync
 
-A Contentful App that lets you take **any** content type in your space and sync it into a
-Salesforce Marketing Cloud Engagement (SFMC) **Data Extension** — create the DE's schema in MCE
-(if it doesn't exist yet), backfill every already-published entry, and keep it in sync on every
-future publish/unpublish/delete. No pre-existing Data Extension is required to get started; the
-app can create one for you.
+A Contentful App that syncs **any** content type in your space into a Salesforce Marketing Cloud
+Engagement (MCE) **Data Extension**. It can:
 
-Routing is entirely driven by two content types the app manages in your own space
-(`dataExtensionRegistry` and `deSyncLinkage`) — there are no hardcoded content-type or Data
-Extension names anywhere in the code. Link as many content types to as many Data Extensions as
-you want.
+- create the DE's schema in MCE, including as a **Shared Data Extension in the parent BU**, so the
+  content can be shared to child BUs
+- backfill every already-published entry
+- upsert rows on every publish and deactivate them on every unpublish
+- let you choose which fields sync, and add columns to the DE when you add fields later
 
-This app is a sibling to `contentful-mo-sync` (which targets classic Salesforce core-org
-Marketing Objects) — same UI/UX pattern, same registry-driven routing, but targeting SFMC Data
-Extensions instead, over SOAP (schema) + REST (rows) rather than Metadata REST + Bulk API 2.0.
+Routing comes entirely from two content types the app manages in your space
+(`dataExtensionRegistry` and `deSyncLinkage`). No content-type or Data Extension names are
+hardcoded. Link as many content types to as many Data Extensions as you want.
 
-## What this actually is
-
-- A Contentful **App** (Page + Configure screen, built with React/Forma 36) that runs inside
-  Contentful's Apps UI.
-- Two **App Action** Functions it calls to talk to Marketing Cloud Engagement: derive-and-create
-  a new DE schema (`createDataExtension`, synchronous — see below) and backfill existing entries
-  (`backfillDeRows`, also synchronous).
-- One **App Event Handler** Function (`paloniaEngagementSync`) that fires on every
-  `Entry.publish`/`unpublish`/`delete` in the space, checks whether the entry's content type has
-  an active `deSyncLinkage`, and if so upserts/deactivates the corresponding DE rows.
-- Two Contentful content types (`dataExtensionRegistry`, `deSyncLinkage`) that make the whole
-  thing config-driven instead of hardcoded — see `migrations/02-de-sync-registry.js`.
+This app is a sibling to `contentful-mo-sync`, which targets Salesforce Marketing Objects. It has
+the same UI and the same registry-driven routing, but talks to MCE over SOAP (schema) and REST
+(rows) instead of Metadata REST and Bulk API 2.0.
 
 ## Architecture
 
 ```
 Contentful Apps UI ("Data Extension Sync" page)
-   │  create/link/unlink/backfill, backed by the contentful-management SDK
+   │  create / link / unlink / backfill / edit fields, via the contentful-management SDK
    ▼
-dataExtensionRegistry / deSyncLinkage  (content types in your own space — the routing table)
+dataExtensionRegistry / deSyncLinkage   (content types in your space — the routing table)
    │
-   ├─ App Action: createDataExtension → derives a schema from a content type's fields, creates
-   │                                      the DE via SOAP Partner API CreateRequest — synchronous,
-   │                                      no polling needed (unlike MO-sync's Metadata REST deploy)
+   ├─ App Action  createDataExtension  derive a schema from a content type, create the DE
+   │                                   (SOAP CreateRequest, synchronous)
+   ├─ App Action  backfillDeRows       copy every published entry into the DE
+   │                                   (Data Extension Rows (Synchronous) REST rowset)
+   ├─ App Action  addDeFields          add columns for newly selected fields (SOAP UpdateRequest)
+   ├─ App Action  checkMceConnection   read-only: credentials, parent BU, Shared folder
    │
-   ├─ App Action: backfillDeRows → CMA-reads every published entry of a content type, maps to DE
-   │                                 rows, upserts via the Data Extension Rows (Synchronous) REST
-   │                                 rowset endpoint — synchronous, no polling needed (unlike
-   │                                 MO-sync's Bulk API 2.0 job)
-   │
-   └─ App Event Handler: paloniaEngagementSync → fires on every Entry.publish/unpublish/delete,
-                          looks up the active deSyncLinkage for that content type, and (if found)
-                          upserts/deactivates that entry's DE rows via the same rowset endpoint
+   └─ App Event   entryPublishSync     Entry.publish → upsert rows; Entry.unpublish → IsActive=false
 ```
 
-Every Function authenticates to Marketing Cloud Engagement independently via OAuth 2.0 Client
-Credentials against an Installed Package (`MCE_AUTH_BASE_URL`/`MCE_CLIENT_ID`/`MCE_CLIENT_SECRET`,
-read from this app's installation parameters) — there's no session shared with MCE beyond that
-token exchange.
+Every Function authenticates to MCE on its own via OAuth 2.0 client credentials against an
+Installed Package, using this app's installation parameters.
 
-**Why no polling:** unlike Salesforce core-org's async Metadata deploy and Bulk API 2.0 jobs, both
-SFMC operations this app needs are genuinely synchronous — SOAP `CreateRequest` for a DE returns
-`OverallStatus` in the same response, and the Data Extension Rows (Synchronous) REST API is, as
-its name says, synchronous. This was confirmed against a live tenant before building the app
-around it, not assumed.
+**Why no polling:** both MCE operations the app needs are synchronous. SOAP `CreateRequest`
+returns `OverallStatus` in the same response, and the Data Extension Rows (Synchronous) REST API
+returns its result in one round trip. Very large content types (many thousands of entries) can
+still hit the Function execution time limit during a backfill.
 
-**No delete:** the SFMC REST API for DE rows has no delete operation, only upsert (`PUT`/`POST`
-under `/hub/v1/dataevents/`). Unpublish/delete events are handled the same way `contentful-mo-sync`
-handles them — a soft-deactivate upsert that sets `IsActive` to `false` rather than removing the row.
+**No row delete:** the rowset API has no delete, only upsert. Unpublish sets `IsActive` to `false`
+on the entry's rows instead of removing them. `Entry.delete`/`Entry.archive` aren't subscribed:
+Contentful requires an unpublish first, and that already deactivated the rows.
+
+## Business units and Shared Data Extensions
+
+MCE tokens act in one business unit at a time. This app supports two placements for the Data
+Extensions it creates:
+
+| Parent BU MID (`MCE_PARENT_MID`) | Where new DEs go | Who can use them |
+|---|---|---|
+| **Set** (recommended for multi-BU accounts) | Parent BU › Shared Data Extensions › Contentful | The parent, and every child BU you share them with |
+| Blank | Installed Package's default BU › Data Extensions › Contentful | That BU only |
+
+With a parent MID set:
+
+- The DE is created with a parent-BU token (`account_id` = the MID) inside a
+  `shared_dataextension` folder. That is what makes it a Shared Data Extension; there is no
+  separate flag.
+- Every row (backfill, publish, unpublish) is written in the parent BU. Child BUs it's shared with
+  see the same rows.
+- **Sharing to child BUs is configured in Marketing Cloud, not by this app.** In the parent BU,
+  open Shared Data Extensions, find the **Contentful** folder, and set its sharing (or the DE's)
+  to the child BUs that should see it. MCE has no API for per-BU sharing.
+- In a child BU, refer to a shared DE with the `ENT.` prefix, e.g. `ENT.TravelOffer_DE` in
+  AMPscript or SQL Query Activities.
+- Each registry entry records the BU it lives in (`businessUnitMid`, `isShared`), so changing the
+  parent MID later only affects DEs created afterwards. Existing DEs keep syncing to the BU they're in.
 
 ## Prerequisites
 
 - A Contentful space on a plan with App Framework access (Functions + custom Apps).
-- The Contentful CLI (`npm i -g contentful-cli` or use `npx`) authenticated
-  (`contentful login`), for running the registry migration.
-- A Marketing Cloud Engagement **Installed Package** (Setup → Platform Tools → Apps →
-  Installed Packages) with a **Server-to-Server** (or API Integration) component configured for
-  OAuth 2.0 Client Credentials, granted:
-  - `Data Extensions` — Read and Write (needed for both DE schema creation via SOAP and row
-    upserts via REST).
-- Your tenant's three MCE base URLs (Installed Package's API Integration component shows these):
-  Auth (`https://<subdomain>.auth.marketingcloudapis.com/`), REST
-  (`https://<subdomain>.rest.marketingcloudapis.com/`), and SOAP
-  (`https://<subdomain>.soap.marketingcloudapis.com/`).
+- Node.js 20 (`engines`: `>=20 <22`).
+- An MCE **Installed Package** (Setup → Platform Tools → Apps → Installed Packages) with an
+  **API Integration** component of type **Server-to-Server**, granted:
+  - **Data Extensions**: Read and Write. Needed for schema creation and updates (SOAP) and row
+    upserts (REST).
+- For Shared Data Extensions, the package must have **access to the parent (Enterprise) BU**.
+  Create the package in the parent BU, and under the API Integration's **Account access** include
+  the parent BU (and any child BUs you want to test against).
+- Your tenant's three base URLs, shown on the API Integration component:
+  - `https://<subdomain>.auth.marketingcloudapis.com/`
+  - `https://<subdomain>.rest.marketingcloudapis.com/`
+  - `https://<subdomain>.soap.marketingcloudapis.com/`
+- The parent BU's **MID**, if you want Shared Data Extensions. It's shown in Setup → Business Units
+  (top of the hierarchy) or under your account name in the MCE header when you're in the parent BU.
 
 ## Install
 
-1. **Point the manifest at your tenant.** Edit `app/contentful-app-manifest.json` and replace
-   every `YOUR_SUBDOMAIN.{auth,rest,soap}.marketingcloudapis.com` placeholder in the
-   `allowNetworks` arrays with your real MCE subdomain — Contentful Functions can only call hosts
-   explicitly allowed here.
+From `app/`:
 
-2. **Scaffold and upload the app**, from `app/`:
+1. **Create, build and upload the app:**
    ```bash
    npm install
    npx contentful-app-scripts create-app-definition   # first time only — creates the App Definition
    npm run build
    npm run upload
+   npm run upsert-actions
    ```
-   (Standard `create-contentful-app` flow — see `app/README.md` for what each script does.)
+   `contentful-app-manifest.json` allows `*.marketingcloudapis.com`, so it works for any tenant
+   without edits.
 
-3. **Run the registry migration** against your space, so `dataExtensionRegistry` and
-   `deSyncLinkage` exist:
+2. **Declare the installation parameters and subscribe to publish events.** This is required:
+   without it, publishing never syncs, and the client ID and secret aren't stored as secrets.
    ```bash
-   npx contentful space migration --space-id $CF_SPACE_ID --environment-id master \
-       migrations/02-de-sync-registry.js
+   CONTENTFUL_ACCESS_TOKEN=... CONTENTFUL_ORG_ID=... CONTENTFUL_APP_DEF_ID=... npm run setup-app-definition
    ```
+   The script is idempotent; re-run it after changing `INSTALLATION_PARAMETERS` or the subscribed topics.
 
-4. **Install the app** on your space (Contentful web app → Apps → your app → Install), then open
-   its **Configure** screen and fill in:
-   - Contentful Space Id / Environment Id — this app's own space, read back via the CDA.
-   - Contentful CDA Token (Settings → API keys → Content Delivery API access token).
-   - MCE Auth/REST/SOAP Base URLs, Installed Package Client ID, Installed Package Client Secret.
+3. **Install the app** on your space (Apps → your app → Install), then fill in the Configure screen:
+   - the three base URLs, Installed Package client ID and client secret
+   - **Parent BU MID**, to create Shared Data Extensions (see above)
 
-5. **Link a content type to a Data Extension**, from the app's Page tab:
-   - **Brand-new DE:** click **Create Net-New Data Extension**, pick a content type, optionally
-     add extra field labels, click **Create & Link**. This derives a schema from the content
-     type's fields, creates the DE in Marketing Cloud Engagement via SOAP, registers it in
-     `dataExtensionRegistry`, creates the `deSyncLinkage`, and backfills every already-published
-     entry — all in one step.
-   - **Existing DE:** create and publish a `dataExtensionRegistry` entry by hand in the
-     Contentful web app (see field reference below — at minimum `deLabel`, `deExternalKey`,
-     `pkFieldApiName`), then on the Page tab select the content type and that registry row and
-     click **Link Selected**. This also runs an initial backfill automatically.
-   - **Backfill Now** / **Unlink Selected** are available any time for a linked content type.
+   Saving creates the `dataExtensionRegistry` and `deSyncLinkage` content types if they don't
+   exist yet, then runs **Check connection**. That check verifies the credentials, that the MID
+   really is the parent BU, and that its Shared Data Extensions folder is reachable. It changes nothing.
+   (`migrations/02-de-sync-registry.js` creates the same content types from the CLI, if you'd
+   rather provision them that way.)
 
-From this point on, publishing, unpublishing, or deleting any entry of a linked content type
-syncs automatically — no further action needed.
+4. **Link a content type to a Data Extension** from the app's page:
+   - **Brand-new DE:** **Create Net-New Data Extension**, pick a content type, choose the fields
+     to sync, optionally add extra text columns, then **Create & Link**. This creates the DE, registers
+     it, links the content type, and backfills every published entry in one step.
+   - **Existing DE:** create and publish a `dataExtensionRegistry` entry by hand (at minimum
+     `deLabel`, `deExternalKey`, `pkFieldApiName`, and `businessUnitMid` if the DE isn't in the
+     package's default BU). Then select the content type and that entry and click **Link Selected**.
+     This also backfills.
+   - **Edit Fields** changes which fields sync. Newly checked fields get a column in the DE first;
+     unchecked fields keep their column and stop being written. It then re-backfills.
+   - **Backfill Now** and **Unlink Selected** are available any time for a linked content type.
+
+From then on, publishing or unpublishing any entry of a linked content type syncs automatically.
+
+## Row shape
+
+Every DE the app creates has a primary key `ExternalKey` = `<business key>__<locale>`, one row per
+locale. The business key is the entry id (`__entryId`) for every linkage the app creates. It also
+writes these bookkeeping columns:
+
+`ContentfulEntryId`, `ContentfulSpaceId`, `ContentTypeId`, `Locale`, `ContentVersion`,
+`PublishedAt`, `IsActive`, `SourceSystem`.
+
+Field types map as: Symbol → Text(255); Text, Number and a list of Symbols (comma-joined) →
+Text(4000); Integer → Number; Date → Date; Boolean → Boolean. Link (single or list), Rich Text,
+JSON Object and Location fields aren't synced yet: there's no generic mapping rule for them.
 
 ## Configuration reference
 
-### App installation parameters (Configure screen)
+### App installation parameters
 
-| Parameter | Required | Description |
-|---|---|---|
-| `CF_SPACE_ID` | Yes | This app's own Contentful space id. |
-| `CF_ENVIRONMENT_ID` | No (default `master`) | This app's own environment id. |
-| `CF_CDA_TOKEN` | Yes | Content Delivery API token for the same space. Secret — write-only once saved. |
-| `MCE_AUTH_BASE_URL` | Yes | Tenant's auth base URL, e.g. `https://<subdomain>.auth.marketingcloudapis.com/`. |
-| `MCE_REST_BASE_URL` | Yes | Tenant's REST base URL, e.g. `https://<subdomain>.rest.marketingcloudapis.com/`. |
-| `MCE_SOAP_BASE_URL` | Yes | Tenant's SOAP base URL, e.g. `https://<subdomain>.soap.marketingcloudapis.com/`. |
-| `MCE_CLIENT_ID` | Yes | Installed Package Client ID. Secret. |
-| `MCE_CLIENT_SECRET` | Yes | Installed Package Client Secret. Secret. |
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `MCE_AUTH_BASE_URL` | Symbol | Yes | `https://<subdomain>.auth.marketingcloudapis.com/` |
+| `MCE_REST_BASE_URL` | Symbol | Yes | `https://<subdomain>.rest.marketingcloudapis.com/` |
+| `MCE_SOAP_BASE_URL` | Symbol | Yes | `https://<subdomain>.soap.marketingcloudapis.com/` |
+| `MCE_CLIENT_ID` | Secret | Yes | Installed Package client ID |
+| `MCE_CLIENT_SECRET` | Secret | Yes | Installed Package client secret |
+| `MCE_PARENT_MID` | Symbol | No | Parent (Enterprise) BU MID. Set = new DEs are Shared Data Extensions there |
 
 ### `dataExtensionRegistry` fields
 
 | Field | Description |
 |---|---|
 | `deLabel` | Display label. |
-| `deExternalKey` | Data Extension `CustomerKey`/external key in Marketing Cloud Engagement. Unique. Unlike Salesforce Marketing Objects, DE external keys/field names have no required suffix (plain PascalCase, e.g. `TravelOffer_DE`, not `__mo`/`__c`). |
-| `pkFieldApiName` | The DE field used as the rowset upsert key. Defaults to `ExternalKey`. |
-| `fieldMap` | JSON object `{ fields: [{ apiName, label, fieldType, length?, contentfulFieldId? }] }` — the derived or hand-authored field mapping. |
-| `excludedFieldIds` | Contentful field ids to skip. |
-| `deployStatus` | `not_deployed` / `deployed` / `failed` — set automatically by the net-new-DE flow. |
-| `lastDeployError` | Set automatically by the net-new-DE flow. |
+| `deExternalKey` | The DE's `CustomerKey`. Unique. |
+| `pkFieldApiName` | The DE column used as the rowset upsert key. Defaults to `ExternalKey`. |
+| `fieldMap` | `{ fields: [{ apiName, label, fieldType, length?, contentfulFieldId? }] }` |
+| `excludedFieldIds` | Contentful field ids that aren't synced. |
+| `deployStatus` | `not_deployed` / `deployed` / `failed`. |
+| `lastDeployError` | Last creation error, if any. |
+| `businessUnitMid` | MID of the BU that owns the DE. Blank = the Installed Package's default BU. |
+| `isShared` | `true` for a Shared Data Extension in the parent BU. |
 
 ### `deSyncLinkage` fields
 
 | Field | Description |
 |---|---|
-| `contentTypeId` | The Contentful content type id this row routes. Unique. |
-| `pkContentfulFieldId` | Which Contentful field supplies the business-key half of the DE row's `ExternalKey` (or the sentinel `__entryId` to use the entry id itself). |
-| `dataExtension` | Link to the `dataExtensionRegistry` entry this content type syncs into. |
-| `isActive` | Soft on/off switch — **Unlink Selected** sets this `false` rather than deleting the row. |
+| `contentTypeId` | The content type this row routes. Unique. |
+| `pkContentfulFieldId` | Field that supplies the business-key half of `ExternalKey`, or `__entryId` for the entry id. |
+| `dataExtension` | Link to the `dataExtensionRegistry` entry. |
+| `isActive` | **Unlink Selected** sets this to `false` rather than deleting the entry. |
 
-## What this deliberately leaves out
+## Development
 
-- **Row delete.** The Data Extension Rows (Synchronous) REST API has no delete operation for DE
-  rows — confirmed by reading the full API reference and by a live 404 test against a real
-  tenant, not assumed. Unpublish/delete are handled as a soft-deactivate upsert instead (see
-  Architecture above).
-- **A Flow-CRUD alternative pathway.** `contentful-mo-sync` ships one (`flow-crud/`, two
-  Salesforce Flows for on-demand upsert/deactivate of one hardcoded MO shape); there's no SFMC
-  equivalent here. If you want synchronous, on-demand single-record sync initiated from outside
-  Contentful, you'd build that directly against the REST rowset endpoint documented above.
-- **A legacy Platform Event pathway.** `contentful-mo-sync`'s `paloniaPublishSync.ts` carries a
-  secondary Salesforce Platform Event sink from an earlier iteration of that integration. It
-  wasn't ported here — this app has exactly one sync pathway, the registry-driven one described
-  above.
+From `app/`:
+
+```bash
+npm run dev         # local UI at http://localhost:3000 (point the App Definition's URL here)
+npm run typecheck
+npm run lint
+npm run test:ci
+npm run build       # typecheck + UI bundle + Function bundles
+```
+
+For local scripts, copy `.env.example` to `.env` (gitignored) — never commit real credentials.
+
+## License
+
+MIT — see `app/LICENSE`.

@@ -1,25 +1,51 @@
 // Minimal hand-rolled SOAP Partner API client for Data Extension schema CRUD. Functions run in a
 // sandbox with no Node built-ins (no XML DOM parser), so envelopes are built with template strings
 // and faults/results are read back with small regexes rather than a real XML parser — sufficient
-// for the fixed, known-shape CreateRequest/RetrieveRequest/DeleteRequest envelopes below.
+// for the fixed, known-shape CreateRequest/RetrieveRequest/UpdateRequest envelopes below.
+//
+// Every call runs in the business unit its token was issued for (see mceAuth.ts getMceToken).
 import { joinUrl, type MceCreds } from './mceAuth';
 import type { DeField } from './deFieldMapping';
 
 const PARTNER_NS = 'http://exacttarget.com/wsdl/partnerAPI';
 
+/** DataFolder ContentType values: a BU's own Data Extensions tree, and the parent BU's Shared Data Extensions tree. */
+export type DeFolderContentType = 'dataextension' | 'shared_dataextension';
+
+export const CONTENTFUL_FOLDER_NAME = 'Contentful';
+
 function xmlEscape(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-async function soapRequest(creds: MceCreds, accessToken: string, soapAction: string, envelope: string): Promise<string> {
+function envelope(accessToken: string, body: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ns="${PARTNER_NS}" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <soapenv:Header>
+    <fueloauth xmlns="http://exacttarget.com">${accessToken}</fueloauth>
+  </soapenv:Header>
+  <soapenv:Body>${body}
+  </soapenv:Body>
+</soapenv:Envelope>`;
+}
+
+async function soapRequest(creds: MceCreds, accessToken: string, soapAction: string, body: string): Promise<string> {
   const res = await fetch(joinUrl(creds.soapBaseUrl, 'Service.asmx'), {
     method: 'POST',
     headers: { 'Content-Type': 'text/xml', SOAPAction: soapAction },
-    body: envelope,
+    body: envelope(accessToken, body),
   });
   const text = await res.text();
   if (!res.ok) throw new Error(`SFMC SOAP ${soapAction} failed (${res.status}): ${text}`);
   return text;
+}
+
+function overallStatus(responseText: string): string | undefined {
+  return /<OverallStatus>([^<]*)<\/OverallStatus>/.exec(responseText)?.[1];
+}
+
+function statusMessage(responseText: string): string {
+  return /<StatusMessage>([^<]*)<\/StatusMessage>/.exec(responseText)?.[1] ?? responseText;
 }
 
 function fieldXml(field: DeField, isPrimaryKey: boolean): string {
@@ -36,21 +62,24 @@ function fieldXml(field: DeField, isPrimaryKey: boolean): string {
 
 export type CreateDataExtensionResult = { ok: true } | { ok: false; statusMessage: string };
 
-/** Synchronous DE schema creation — SOAP CreateRequest returns immediately, no polling needed. */
+/**
+ * Synchronous DE schema creation — SOAP CreateRequest returns immediately, no polling needed. A
+ * Data Extension becomes a Shared Data Extension purely by being created, in the parent BU, inside
+ * a `shared_dataextension` folder (`categoryId`) — there is no separate "shared" flag.
+ */
 export async function createDataExtension(
   creds: MceCreds,
   accessToken: string,
-  params: { externalKey: string; name: string; description?: string; pkField: DeField; fields: DeField[]; categoryId?: number }
+  params: { externalKey: string; name: string; description?: string; pkField: DeField; fields: DeField[]; categoryId?: number },
 ): Promise<CreateDataExtensionResult> {
   const fieldsXml = [fieldXml(params.pkField, true), ...params.fields.map((f) => fieldXml(f, false))].join('');
-  const envelope = `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ns="${PARTNER_NS}">
-  <soapenv:Header>
-    <fueloauth xmlns="http://exacttarget.com">${accessToken}</fueloauth>
-  </soapenv:Header>
-  <soapenv:Body>
+  const responseText = await soapRequest(
+    creds,
+    accessToken,
+    'Create',
+    `
     <ns:CreateRequest>
-      <ns:Objects xsi:type="ns:DataExtension" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <ns:Objects xsi:type="ns:DataExtension">
         <ns:CustomerKey>${xmlEscape(params.externalKey)}</ns:CustomerKey>
         <ns:Name>${xmlEscape(params.name)}</ns:Name>
         ${params.description ? `<ns:Description>${xmlEscape(params.description)}</ns:Description>` : ''}
@@ -60,71 +89,79 @@ export async function createDataExtension(
         <ns:Fields>${fieldsXml}
         </ns:Fields>
       </ns:Objects>
-    </ns:CreateRequest>
-  </soapenv:Body>
-</soapenv:Envelope>`;
-
-  const responseText = await soapRequest(creds, accessToken, 'Create', envelope);
-  const overallStatus = /<OverallStatus>([^<]*)<\/OverallStatus>/.exec(responseText)?.[1];
-  const statusMessage = /<StatusMessage>([^<]*)<\/StatusMessage>/.exec(responseText)?.[1] ?? responseText;
-  if (overallStatus === 'OK') return { ok: true };
-  return { ok: false, statusMessage };
+    </ns:CreateRequest>`,
+  );
+  if (overallStatus(responseText) === 'OK') return { ok: true };
+  return { ok: false, statusMessage: statusMessage(responseText) };
 }
 
-/** Finds a Data Extension folder by exact name; returns its numeric ID, or null if none exists. */
-export async function findDataExtensionFolderId(creds: MceCreds, accessToken: string, name: string): Promise<number | null> {
-  const envelope = `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ns="${PARTNER_NS}">
-  <soapenv:Header>
-    <fueloauth xmlns="http://exacttarget.com">${accessToken}</fueloauth>
-  </soapenv:Header>
-  <soapenv:Body>
+export type DataFolder = { id: number; name: string; parentId: number | null };
+
+/** Parses DataFolder results. A folder's own `<ID>` is the one outside its nested `<ParentFolder>`/`<Client>` blocks. */
+export function parseDataFolders(responseText: string): DataFolder[] {
+  const blocks = responseText.match(/<Results xsi:type="DataFolder">[\s\S]*?<\/Results>/g) ?? [];
+  return blocks.flatMap((block) => {
+    const parentBlock = /<ParentFolder>([\s\S]*?)<\/ParentFolder>/.exec(block)?.[1] ?? '';
+    const own = block.replace(/<ParentFolder>[\s\S]*?<\/ParentFolder>/, '').replace(/<Client>[\s\S]*?<\/Client>/, '');
+    const id = /<ID>([^<]*)<\/ID>/.exec(own)?.[1];
+    if (!id) return [];
+    const parentId = /<ID>([^<]*)<\/ID>/.exec(parentBlock)?.[1];
+    return [{ id: Number(id), name: /<Name>([^<]*)<\/Name>/.exec(own)?.[1] ?? '', parentId: parentId == null ? null : Number(parentId) }];
+  });
+}
+
+/** Every folder of one ContentType in the token's BU. */
+export async function listDataExtensionFolders(creds: MceCreds, accessToken: string, contentType: DeFolderContentType): Promise<DataFolder[]> {
+  const responseText = await soapRequest(
+    creds,
+    accessToken,
+    'Retrieve',
+    `
     <ns:RetrieveRequestMsg>
       <ns:RetrieveRequest>
         <ns:ObjectType>DataFolder</ns:ObjectType>
         <ns:Properties>ID</ns:Properties>
         <ns:Properties>Name</ns:Properties>
-        <ns:Properties>ContentType</ns:Properties>
-        <ns:Filter xsi:type="ns:ComplexFilterPart" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-          <ns:LeftOperand xsi:type="ns:SimpleFilterPart">
-            <ns:Property>Name</ns:Property>
-            <ns:SimpleOperator>equals</ns:SimpleOperator>
-            <ns:Value>${xmlEscape(name)}</ns:Value>
-          </ns:LeftOperand>
-          <ns:LogicalOperator>AND</ns:LogicalOperator>
-          <ns:RightOperand xsi:type="ns:SimpleFilterPart">
-            <ns:Property>ContentType</ns:Property>
-            <ns:SimpleOperator>equals</ns:SimpleOperator>
-            <ns:Value>dataextension</ns:Value>
-          </ns:RightOperand>
+        <ns:Properties>ParentFolder.ID</ns:Properties>
+        <ns:Filter xsi:type="ns:SimpleFilterPart">
+          <ns:Property>ContentType</ns:Property>
+          <ns:SimpleOperator>equals</ns:SimpleOperator>
+          <ns:Value>${contentType}</ns:Value>
         </ns:Filter>
       </ns:RetrieveRequest>
-    </ns:RetrieveRequestMsg>
-  </soapenv:Body>
-</soapenv:Envelope>`;
-
-  const responseText = await soapRequest(creds, accessToken, 'Retrieve', envelope);
-  const id = /<ID>([^<]*)<\/ID>/.exec(responseText)?.[1];
-  return id ? Number(id) : null;
+    </ns:RetrieveRequestMsg>`,
+  );
+  const status = overallStatus(responseText);
+  if (status !== 'OK' && status !== 'MoreDataAvailable') throw new Error(`Listing ${contentType} folders failed: ${statusMessage(responseText)}`);
+  return parseDataFolders(responseText);
 }
 
-/** Creates a new Data Extension folder and returns its numeric ID. */
-export async function createDataExtensionFolder(
+/**
+ * The top of a folder tree: the folder whose parent isn't in the same tree. For `dataextension`
+ * that's "Data Extensions" (parent 0); for `shared_dataextension` it's "Shared Data Extensions",
+ * whose parent is a folder of a different type.
+ */
+export function findRootFolder(folders: DataFolder[]): DataFolder | undefined {
+  const ids = new Set(folders.map((f) => f.id));
+  return folders.find((f) => f.parentId == null || !ids.has(f.parentId));
+}
+
+async function createDataExtensionFolder(
   creds: MceCreds,
   accessToken: string,
-  params: { name: string; parentId: number }
+  params: { name: string; parentId: number; contentType: DeFolderContentType },
 ): Promise<number> {
-  const envelope = `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ns="${PARTNER_NS}">
-  <soapenv:Header>
-    <fueloauth xmlns="http://exacttarget.com">${accessToken}</fueloauth>
-  </soapenv:Header>
-  <soapenv:Body>
+  const responseText = await soapRequest(
+    creds,
+    accessToken,
+    'Create',
+    `
     <ns:CreateRequest>
-      <ns:Objects xsi:type="ns:DataFolder" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <ns:Objects xsi:type="ns:DataFolder">
+        <ns:CustomerKey>${xmlEscape(`${params.name}_${params.contentType}`)}</ns:CustomerKey>
         <ns:Name>${xmlEscape(params.name)}</ns:Name>
-        <ns:Description>Data Extensions created by the Contentful sync apps.</ns:Description>
-        <ns:ContentType>dataextension</ns:ContentType>
+        <ns:Description>Data Extensions created by the Contentful sync app.</ns:Description>
+        <ns:ContentType>${params.contentType}</ns:ContentType>
         <ns:IsActive>true</ns:IsActive>
         <ns:IsEditable>true</ns:IsEditable>
         <ns:AllowChildren>true</ns:AllowChildren>
@@ -132,118 +169,98 @@ export async function createDataExtensionFolder(
           <ns:ID>${params.parentId}</ns:ID>
         </ns:ParentFolder>
       </ns:Objects>
-    </ns:CreateRequest>
-  </soapenv:Body>
-</soapenv:Envelope>`;
-
-  const responseText = await soapRequest(creds, accessToken, 'Create', envelope);
-  const overallStatus = /<OverallStatus>([^<]*)<\/OverallStatus>/.exec(responseText)?.[1];
-  if (overallStatus !== 'OK') {
-    const statusMessage = /<StatusMessage>([^<]*)<\/StatusMessage>/.exec(responseText)?.[1] ?? responseText;
-    throw new Error(`Failed to create Data Extension folder "${params.name}": ${statusMessage}`);
+    </ns:CreateRequest>`,
+  );
+  if (overallStatus(responseText) !== 'OK') {
+    throw new Error(`Failed to create Data Extension folder "${params.name}": ${statusMessage(responseText)}`);
   }
   const newId = /<NewID>([^<]*)<\/NewID>/.exec(responseText)?.[1];
   if (!newId) throw new Error(`Data Extension folder "${params.name}" created but no NewID was returned: ${responseText}`);
   return Number(newId);
 }
 
-/** Finds the root ("ParentFolder.ID = 0") Data Extensions folder, i.e. the top-level tree node. */
-export async function findRootDataExtensionFolderId(creds: MceCreds, accessToken: string): Promise<number | null> {
-  const envelope = `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ns="${PARTNER_NS}">
-  <soapenv:Header>
-    <fueloauth xmlns="http://exacttarget.com">${accessToken}</fueloauth>
-  </soapenv:Header>
-  <soapenv:Body>
-    <ns:RetrieveRequestMsg>
-      <ns:RetrieveRequest>
-        <ns:ObjectType>DataFolder</ns:ObjectType>
-        <ns:Properties>ID</ns:Properties>
-        <ns:Properties>Name</ns:Properties>
-        <ns:Properties>ParentFolder.ID</ns:Properties>
-        <ns:Filter xsi:type="ns:SimpleFilterPart" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-          <ns:Property>ContentType</ns:Property>
-          <ns:SimpleOperator>equals</ns:SimpleOperator>
-          <ns:Value>dataextension</ns:Value>
-        </ns:Filter>
-      </ns:RetrieveRequest>
-    </ns:RetrieveRequestMsg>
-  </soapenv:Body>
-</soapenv:Envelope>`;
-
-  const responseText = await soapRequest(creds, accessToken, 'Retrieve', envelope);
-  const resultBlocks = responseText.match(/<Results xsi:type="DataFolder">[\s\S]*?<\/Results>/g) ?? [];
-  for (const block of resultBlocks) {
-    const parentId = /<ParentFolder>[\s\S]*?<ID>([^<]*)<\/ID>/.exec(block)?.[1];
-    if (parentId === '0') {
-      const id = /<ID>([^<]*)<\/ID>/.exec(block)?.[1];
-      if (id) return Number(id);
-    }
+/**
+ * Idempotently ensures a folder named `name` exists directly under the root of the `contentType`
+ * tree in the token's BU, returning its ID (creating it on first call).
+ */
+export async function ensureDataExtensionFolder(creds: MceCreds, accessToken: string, name: string, contentType: DeFolderContentType): Promise<number> {
+  const folders = await listDataExtensionFolders(creds, accessToken, contentType);
+  const root = findRootFolder(folders);
+  if (!root) {
+    const tree = contentType === 'shared_dataextension' ? 'Shared Data Extensions' : 'Data Extensions';
+    throw new Error(`Could not locate the root "${tree}" folder in this business unit.`);
   }
-  return null;
+  const existing = folders.find((f) => f.name === name && f.parentId === root.id);
+  if (existing) return existing.id;
+  return createDataExtensionFolder(creds, accessToken, { name, parentId: root.id, contentType });
 }
 
-/** Idempotently ensures a named Data Extension folder exists directly under the account's root
- * Data Extensions folder, returning its ID (creating it on first call). */
-export async function ensureDataExtensionFolder(creds: MceCreds, accessToken: string, name: string): Promise<number> {
-  const existing = await findDataExtensionFolderId(creds, accessToken, name);
-  if (existing) return existing;
-  const rootId = await findRootDataExtensionFolderId(creds, accessToken);
-  if (!rootId) throw new Error('Could not locate the root Data Extensions folder to nest the new folder under.');
-  return createDataExtensionFolder(creds, accessToken, { name, parentId: rootId });
-}
-
-/** Moves an existing Data Extension into a different folder via SOAP UpdateRequest. */
-export async function moveDataExtensionToFolder(
-  creds: MceCreds,
-  accessToken: string,
-  params: { externalKey: string; categoryId: number }
-): Promise<void> {
-  const envelope = `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ns="${PARTNER_NS}">
-  <soapenv:Header>
-    <fueloauth xmlns="http://exacttarget.com">${accessToken}</fueloauth>
-  </soapenv:Header>
-  <soapenv:Body>
-    <ns:UpdateRequest>
-      <ns:Objects xsi:type="ns:DataExtension" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-        <ns:CustomerKey>${xmlEscape(params.externalKey)}</ns:CustomerKey>
-        <ns:CategoryID>${params.categoryId}</ns:CategoryID>
-      </ns:Objects>
-    </ns:UpdateRequest>
-  </soapenv:Body>
-</soapenv:Envelope>`;
-
-  const responseText = await soapRequest(creds, accessToken, 'Update', envelope);
-  const overallStatus = /<OverallStatus>([^<]*)<\/OverallStatus>/.exec(responseText)?.[1];
-  if (overallStatus !== 'OK') {
-    const statusMessage = /<StatusMessage>([^<]*)<\/StatusMessage>/.exec(responseText)?.[1] ?? responseText;
-    throw new Error(`Failed to move Data Extension "${params.externalKey}": ${statusMessage}`);
-  }
-}
-
-/** True if a Data Extension with this external key already exists in the tenant. */
+/** True if a Data Extension with this external key already exists in the token's BU. */
 export async function dataExtensionExists(creds: MceCreds, accessToken: string, externalKey: string): Promise<boolean> {
-  const envelope = `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ns="${PARTNER_NS}">
-  <soapenv:Header>
-    <fueloauth xmlns="http://exacttarget.com">${accessToken}</fueloauth>
-  </soapenv:Header>
-  <soapenv:Body>
+  const responseText = await soapRequest(
+    creds,
+    accessToken,
+    'Retrieve',
+    `
     <ns:RetrieveRequestMsg>
       <ns:RetrieveRequest>
         <ns:ObjectType>DataExtension</ns:ObjectType>
         <ns:Properties>CustomerKey</ns:Properties>
-        <ns:Filter xsi:type="ns:SimpleFilterPart" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        <ns:Filter xsi:type="ns:SimpleFilterPart">
           <ns:Property>CustomerKey</ns:Property>
           <ns:SimpleOperator>equals</ns:SimpleOperator>
           <ns:Value>${xmlEscape(externalKey)}</ns:Value>
         </ns:Filter>
       </ns:RetrieveRequest>
-    </ns:RetrieveRequestMsg>
-  </soapenv:Body>
-</soapenv:Envelope>`;
-
-  const responseText = await soapRequest(creds, accessToken, 'Retrieve', envelope);
+    </ns:RetrieveRequestMsg>`,
+  );
   return /<CustomerKey>([^<]*)<\/CustomerKey>/.test(responseText);
+}
+
+/** Column names of an existing Data Extension in the token's BU. */
+export async function listDataExtensionFieldNames(creds: MceCreds, accessToken: string, externalKey: string): Promise<string[]> {
+  const responseText = await soapRequest(
+    creds,
+    accessToken,
+    'Retrieve',
+    `
+    <ns:RetrieveRequestMsg>
+      <ns:RetrieveRequest>
+        <ns:ObjectType>DataExtensionField</ns:ObjectType>
+        <ns:Properties>Name</ns:Properties>
+        <ns:Filter xsi:type="ns:SimpleFilterPart">
+          <ns:Property>DataExtension.CustomerKey</ns:Property>
+          <ns:SimpleOperator>equals</ns:SimpleOperator>
+          <ns:Value>${xmlEscape(externalKey)}</ns:Value>
+        </ns:Filter>
+      </ns:RetrieveRequest>
+    </ns:RetrieveRequestMsg>`,
+  );
+  const status = overallStatus(responseText);
+  if (status !== 'OK' && status !== 'MoreDataAvailable') throw new Error(`Reading the fields of "${externalKey}" failed: ${statusMessage(responseText)}`);
+  return [...responseText.matchAll(/<Name>([^<]*)<\/Name>/g)].map((m) => m[1]);
+}
+
+/** Adds nullable columns to an existing Data Extension (SOAP UpdateRequest). Existing columns and rows are untouched. */
+export async function addDataExtensionFields(
+  creds: MceCreds,
+  accessToken: string,
+  externalKey: string,
+  fields: DeField[],
+): Promise<CreateDataExtensionResult> {
+  const responseText = await soapRequest(
+    creds,
+    accessToken,
+    'Update',
+    `
+    <ns:UpdateRequest>
+      <ns:Objects xsi:type="ns:DataExtension">
+        <ns:CustomerKey>${xmlEscape(externalKey)}</ns:CustomerKey>
+        <ns:Fields>${fields.map((f) => fieldXml(f, false)).join('')}
+        </ns:Fields>
+      </ns:Objects>
+    </ns:UpdateRequest>`,
+  );
+  if (overallStatus(responseText) === 'OK') return { ok: true };
+  return { ok: false, statusMessage: statusMessage(responseText) };
 }

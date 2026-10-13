@@ -4,16 +4,27 @@
  * CreateRequest. Unlike the Marketing-Object-sync app's net-new deploy (an async Salesforce
  * Metadata REST deploy needing a start/poll split), SFMC's DE schema CreateRequest returns
  * success/failure in the same SOAP response — no polling counterpart is needed.
+ *
+ * Placement: when MCE_PARENT_MID is configured, the DE is created with a parent-BU token inside
+ * Shared Data Extensions › Contentful, which makes it a Shared Data Extension that the parent can
+ * share to child BUs (sharing itself is configured in the Marketing Cloud UI). Otherwise it's a
+ * regular DE in the Installed Package's default BU, under Data Extensions › Contentful.
  */
 import type { AppActionRequest, FunctionEventContext, FunctionEventHandler, FunctionTypeEnum } from '@contentful/node-apps-toolkit';
-import { readMceCreds, getMceToken } from './lib/mceAuth';
-import { createDataExtension as soapCreateDataExtension, dataExtensionExists, ensureDataExtensionFolder } from './lib/mceSoap';
+import { readMceCreds, getMceToken, missingCredsError } from './lib/mceAuth';
+import {
+  CONTENTFUL_FOLDER_NAME,
+  createDataExtension as soapCreateDataExtension,
+  dataExtensionExists,
+  ensureDataExtensionFolder,
+} from './lib/mceSoap';
 import {
   PK_FIELD,
   FIXED_FIELDS,
   deriveDeFieldsFromContentType,
   deriveDeExternalKey,
   sanitizeApiNameBase,
+  type ContentTypeLike,
   type DeField,
 } from './lib/deFieldMapping';
 
@@ -37,12 +48,9 @@ export const handler: FunctionEventHandler<FunctionTypeEnum.AppActionCall> = asy
   }
 
   const creds = readMceCreds(context);
-  if (!creds.authBaseUrl || !creds.soapBaseUrl || !creds.clientId || !creds.clientSecret) {
-    return {
-      ok: false,
-      error: 'Marketing Cloud Engagement credentials are not configured on this app installation.',
-    };
-  }
+  const credsError = missingCredsError(creds, ['soap']);
+  if (credsError) return { ok: false, error: credsError };
+  const isShared = Boolean(creds.parentMid);
 
   const cma = context.cma;
   if (!cma) return { ok: false, error: 'CMA client is not available in this function context.' };
@@ -60,7 +68,7 @@ export const handler: FunctionEventHandler<FunctionTypeEnum.AppActionCall> = asy
 
   const excludedFieldIds = (body.excludedFieldIds || '').split(',').map((s) => s.trim()).filter(Boolean);
   const fixedApiNames = new Set(FIXED_FIELDS.map((f) => f.apiName));
-  const derivedFields = deriveDeFieldsFromContentType(contentType as any, excludedFieldIds).filter(
+  const derivedFields = deriveDeFieldsFromContentType(contentType as unknown as ContentTypeLike, excludedFieldIds).filter(
     (f) => !fixedApiNames.has(f.apiName)
   );
 
@@ -84,7 +92,7 @@ export const handler: FunctionEventHandler<FunctionTypeEnum.AppActionCall> = asy
 
   let token;
   try {
-    token = await getMceToken(creds);
+    token = await getMceToken(creds, creds.parentMid);
   } catch (err) {
     return { ok: false, error: `Marketing Cloud Engagement auth failed: ${(err as Error).message}` };
   }
@@ -110,10 +118,20 @@ export const handler: FunctionEventHandler<FunctionTypeEnum.AppActionCall> = asy
   }
 
   let categoryId: number | undefined;
-  try {
-    categoryId = await ensureDataExtensionFolder(creds, token.accessToken, 'Contentful');
-  } catch {
-    // Folder placement is cosmetic — fall back to the account default rather than failing the sync.
+  if (isShared) {
+    // Not cosmetic here: outside a shared_dataextension folder the DE would silently be a plain
+    // parent-BU DE that child BUs can't see, so fail instead of falling back.
+    try {
+      categoryId = await ensureDataExtensionFolder(creds, token.accessToken, CONTENTFUL_FOLDER_NAME, 'shared_dataextension');
+    } catch (err) {
+      return { ok: false, error: `Could not prepare the Shared Data Extensions folder in parent BU ${creds.parentMid}: ${(err as Error).message}` };
+    }
+  } else {
+    try {
+      categoryId = await ensureDataExtensionFolder(creds, token.accessToken, CONTENTFUL_FOLDER_NAME, 'dataextension');
+    } catch {
+      // Folder placement is cosmetic — fall back to the account default rather than failing the sync.
+    }
   }
 
   const result = await soapCreateDataExtension(creds, token.accessToken, {
@@ -136,5 +154,7 @@ export const handler: FunctionEventHandler<FunctionTypeEnum.AppActionCall> = asy
     pkFieldApiName: PK_FIELD.apiName,
     fields: allFields,
     excludedFieldIds,
+    businessUnitMid: creds.parentMid,
+    isShared,
   };
 };

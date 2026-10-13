@@ -3,12 +3,11 @@
     {
       "id": "createDataExtension",
       "name": "Create Data Extension",
-      "description": "Derives a Data Extension schema from a Contentful content type and creates it synchronously in Marketing Cloud Engagement via SOAP CreateRequest.",
+      "description": "Derives a Data Extension schema from a content type and creates it in Marketing Cloud Engagement (as a Shared Data Extension in the parent BU when MCE_PARENT_MID is set).",
       "path": "functions/createDataExtension.js",
       "entryFile": "functions/createDataExtension.ts",
       "allowNetworks": [
-        "mc4k5825vb2l-5z-5wbjpbfhztk4.soap.marketingcloudapis.com",
-        "mc4k5825vb2l-5z-5wbjpbfhztk4.auth.marketingcloudapis.com"
+        "*.marketingcloudapis.com"
       ],
       "accepts": [
         "appaction.call"
@@ -17,27 +16,50 @@
     {
       "id": "backfillDeRows",
       "name": "Backfill Data Extension Rows",
-      "description": "Copies every already-published entry of a content type into a linked Data Extension via the Data Extension Rows (Synchronous) REST rowset upsert endpoint.",
+      "description": "Copies every already-published entry of a content type into a linked Data Extension via the Data Extension Rows (Synchronous) rowset API.",
       "path": "functions/backfillDeRows.js",
       "entryFile": "functions/backfillDeRows.ts",
       "allowNetworks": [
-        "mc4k5825vb2l-5z-5wbjpbfhztk4.rest.marketingcloudapis.com",
-        "mc4k5825vb2l-5z-5wbjpbfhztk4.auth.marketingcloudapis.com"
+        "*.marketingcloudapis.com"
       ],
       "accepts": [
         "appaction.call"
       ]
     },
     {
-      "id": "paloniaEngagementSync",
-      "name": "Publish -> Marketing Cloud Engagement Sync",
-      "description": "On Entry.publish/unpublish/delete for any content type with an active deSyncLinkage: authenticates to Marketing Cloud Engagement and upserts the linked Data Extension's rows.",
-      "path": "functions/paloniaEngagementSync.js",
-      "entryFile": "functions/paloniaEngagementSync.ts",
+      "id": "addDeFields",
+      "name": "Add Data Extension Fields",
+      "description": "Adds a column to an existing Data Extension for every mapped field it does not have yet.",
+      "path": "functions/addDeFields.js",
+      "entryFile": "functions/addDeFields.ts",
       "allowNetworks": [
-        "mc4k5825vb2l-5z-5wbjpbfhztk4.rest.marketingcloudapis.com",
-        "mc4k5825vb2l-5z-5wbjpbfhztk4.auth.marketingcloudapis.com",
-        "cdn.contentful.com"
+        "*.marketingcloudapis.com"
+      ],
+      "accepts": [
+        "appaction.call"
+      ]
+    },
+    {
+      "id": "checkMceConnection",
+      "name": "Check Marketing Cloud Connection",
+      "description": "Read-only: verifies credentials and the parent BU, and reports where new Data Extensions will be created.",
+      "path": "functions/checkMceConnection.js",
+      "entryFile": "functions/checkMceConnection.ts",
+      "allowNetworks": [
+        "*.marketingcloudapis.com"
+      ],
+      "accepts": [
+        "appaction.call"
+      ]
+    },
+    {
+      "id": "entryPublishSync",
+      "name": "Publish -> Data Extension Sync",
+      "description": "On Entry.publish/unpublish for a content type with an active deSyncLinkage, upserts (or deactivates) its rows in the linked Data Extension.",
+      "path": "functions/entryPublishSync.js",
+      "entryFile": "functions/entryPublishSync.ts",
+      "allowNetworks": [
+        "*.marketingcloudapis.com"
       ],
       "accepts": [
         "appevent.handler"
@@ -116,8 +138,51 @@
           "name": "DE field map (JSON)",
           "type": "Symbol",
           "required": false
+        },
+        {
+          "id": "deMid",
+          "name": "MID of the BU that owns the DE (blank = default BU)",
+          "type": "Symbol",
+          "required": false
         }
       ]
+    },
+    {
+      "id": "addDeFields",
+      "name": "Add Data Extension Fields",
+      "description": "Adds missing columns to an existing Data Extension from a field map.",
+      "type": "function-invocation",
+      "functionId": "addDeFields",
+      "category": "Custom",
+      "parameters": [
+        {
+          "id": "deExternalKey",
+          "name": "DE External Key",
+          "type": "Symbol",
+          "required": true
+        },
+        {
+          "id": "deFieldsJson",
+          "name": "DE field map (JSON)",
+          "type": "Symbol",
+          "required": true
+        },
+        {
+          "id": "deMid",
+          "name": "MID of the BU that owns the DE (blank = default BU)",
+          "type": "Symbol",
+          "required": false
+        }
+      ]
+    },
+    {
+      "id": "checkMceConnection",
+      "name": "Check Marketing Cloud Connection",
+      "description": "Verifies the Marketing Cloud Engagement configuration without changing anything.",
+      "type": "function-invocation",
+      "functionId": "checkMceConnection",
+      "category": "Custom",
+      "parameters": []
     }
   ]
 }

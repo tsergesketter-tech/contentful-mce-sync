@@ -15,19 +15,20 @@
   "scripts": {
     "start": "vite",
     "dev": "vite",
-    "build": "vite build && contentful-app-scripts build-functions --ci",
+    "install-ci": "npm ci",
+    "build": "tsc --noEmit && vite build && contentful-app-scripts build-functions --ci",
     "build-functions": "contentful-app-scripts build-functions --ci",
     "preview": "vite preview",
     "test": "vitest",
     "test:ci": "vitest run",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p functions/tsconfig.json",
     "create-app-definition": "contentful-app-scripts create-app-definition",
     "add-locations": "contentful-app-scripts add-locations",
     "upsert-actions": "contentful-app-scripts upsert-actions",
     "upload": "contentful-app-scripts upload --bundle-dir ./build",
+    "setup-app-definition": "node scripts/setup-app-definition.mjs",
     "upload-ci": "contentful-app-scripts upload --ci --bundle-dir ./build --organization-id $CONTENTFUL_ORG_ID --definition-id $CONTENTFUL_APP_DEF_ID --token $CONTENTFUL_ACCESS_TOKEN"
-  },
-  "eslintConfig": {
-    "extends": "react-app"
   },
   "browserslist": {
     "production": [
@@ -42,7 +43,7 @@
     ]
   },
   "devDependencies": {
-    "@contentful/app-scripts": "^2.3.0",
+    "@contentful/app-scripts": "^4.1.13",
     "@contentful/node-apps-toolkit": "^3.11.1",
     "@testing-library/jest-dom": "^5.17.0",
     "@testing-library/react": "^14.3.1",
@@ -55,7 +56,20 @@
     "jsdom": "^26.0.0",
     "typescript": "4.9.5",
     "vite": "^6.2.2",
-    "vitest": "^3.0.9"
+    "vitest": "^4.1.11",
+    "@eslint/js": "^9.39.2",
+    "@typescript-eslint/eslint-plugin": "^8.54.0",
+    "@typescript-eslint/parser": "^8.54.0",
+    "eslint": "^9.39.2",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "globals": "15.15.0",
+    "typescript-eslint": "^8.54.0"
   },
-  "homepage": "."
+  "homepage": ".",
+  "description": "Sync Contentful content types into Salesforce Marketing Cloud Engagement Data Extensions, including Shared Data Extensions in the parent BU.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20 <22"
+  }
 }

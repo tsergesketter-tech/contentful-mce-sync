@@ -16,4 +16,12 @@ describe('Page component', () => {
       expect(getByText('Data Extension Sync')).toBeInTheDocument();
     });
   });
+
+  it('says new Data Extensions are shared from the parent BU when a parent MID is configured', async () => {
+    const { getByText } = render(<Page />);
+
+    await waitFor(() => {
+      expect(getByText(/created as Shared Data Extensions in parent BU 523012158/)).toBeInTheDocument();
+    });
+  });
 });
