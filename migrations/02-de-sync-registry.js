@@ -1,7 +1,11 @@
 /**
  * Sync registry model: which Data Extensions Contentful knows about, and which content types are
  * linked to which DE. Backs the `app/src/locations/Page.tsx` admin page and is read at runtime by
- * `app/functions/paloniaEngagementSync.ts` to route publishes — no hardcoded constants.
+ * `app/functions/entryPublishSync.ts` to route publishes — no hardcoded constants.
+ *
+ * Optional: saving the app's Configure screen creates the same two content types
+ * (app/src/lib/registryContentTypes.ts — keep the two in sync). Use this migration only to
+ * provision a space from the command line, e.g. in CI.
  *
  * Run with the Contentful CLI:
  *   npx contentful space migration --space-id $CF_SPACE_ID --environment-id master \
@@ -60,6 +64,11 @@ module.exports = function (migration) {
     .defaultValue({ 'en-US': 'not_deployed' });
 
   registry.createField('lastDeployError').name('Last deploy error').type('Text').localized(false);
+
+  // Which BU owns the DE. Blank = the Installed Package's default BU; for a Shared Data Extension
+  // it's the parent (Enterprise) BU, and rows are written there.
+  registry.createField('businessUnitMid').name('Business unit MID').type('Symbol').localized(false);
+  registry.createField('isShared').name('Shared Data Extension').type('Boolean').localized(false);
 
   registry.changeFieldControl('deExternalKey', 'builtin', 'singleLine', {
     helpText: 'Exact Data Extension CustomerKey/external key in Marketing Cloud Engagement.',

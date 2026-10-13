@@ -1,6 +1,6 @@
 import { vi } from 'vitest';
 
-const mockSdk: any = {
+const mockSdk = {
   app: {
     onConfigure: vi.fn(),
     getParameters: vi.fn().mockReturnValueOnce({}),
@@ -9,6 +9,14 @@ const mockSdk: any = {
   },
   ids: {
     app: 'test-app',
+    space: 'test-space',
+    environment: 'master',
+  },
+  locales: {
+    default: 'en-US',
+  },
+  parameters: {
+    installation: { MCE_PARENT_MID: '523012158' },
   },
 };
 

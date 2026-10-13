@@ -22,112 +22,73 @@ import {
 import type { ContentTypeProps, EntryProps } from 'contentful-management';
 import {
   deriveDeFieldsFromContentType,
+  ENTRY_ID_SENTINEL,
+  isSyncableField,
   type ContentTypeField,
   type ContentTypeLike,
   type DeField,
 } from '../../functions/lib/deFieldMapping';
+import { callAppAction, type AppActionIds, type BackfillResult, type CreateDataExtensionResult } from '../lib/appActions';
+import { LINKAGE_CONTENT_TYPE, REGISTRY_CONTENT_TYPE } from '../lib/registryContentTypes';
 
-const REGISTRY_CONTENT_TYPE = 'dataExtensionRegistry';
-const LINKAGE_CONTENT_TYPE = 'deSyncLinkage';
 // The two content types that back this app itself are never sync targets.
 const ADMIN_CONTENT_TYPES = new Set([REGISTRY_CONTENT_TYPE, LINKAGE_CONTENT_TYPE]);
-// Sentinel for deSyncLinkage.pkContentfulFieldId meaning "use entry.sys.id as the business key" —
-// for content types with no natural business-key field of their own.
-const ENTRY_ID_SENTINEL = '__entryId';
 
+// Registry/linkage fields are all non-localized, so their single value lives under whichever
+// locale was the space default when the entry was written.
 function field<T = string>(entry: EntryProps, id: string): T | undefined {
-  return entry.fields?.[id]?.['en-US'];
-}
-
-type AppActionIds = { spaceId: string; environmentId: string; appDefinitionId: string };
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function pollCallDetails(
-  cma: CMAClient,
-  params: AppActionIds & { appActionId: string; callId: string },
-  { retries = 20, intervalMs = 1500 }: { retries?: number; intervalMs?: number } = {}
-) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const details: any = await cma.appActionCall.getCallDetails(params as any);
-      if (details?.response) return details;
-    } catch {
-      // Call log isn't ready yet — keep retrying.
-    }
-    await sleep(intervalMs);
-  }
-  throw new Error('Timed out waiting for the app action to respond.');
-}
-
-// Both App Actions this app calls (createDataExtension, backfillDeRows) are synchronous — SFMC's
-// SOAP CreateRequest and Data Extension Rows (Synchronous) REST API both return a final result in
-// one round trip, unlike the Marketing-Object-sync app's async Salesforce deploy/Bulk-API jobs. No
-// poll counterpart is needed; this still polls appActionCall.getCallDetails itself, since that's
-// how the Contentful CMA surfaces any App Action's response regardless of how the Function inside
-// it behaves.
-async function callAppAction(
-  cma: CMAClient,
-  ids: AppActionIds,
-  appActionId: string,
-  parameters: Record<string, unknown>
-): Promise<any> {
-  const call = await cma.appActionCall.create({ ...ids, appActionId } as any, { parameters });
-  const details = await pollCallDetails(cma, { ...ids, appActionId, callId: call.sys.id });
-  const statusCode = details.response?.statusCode;
-  const rawBody = details.response?.body;
-  let body: any = rawBody;
-  if (typeof rawBody === 'string') {
-    try {
-      body = JSON.parse(rawBody);
-    } catch {
-      // leave as raw string
-    }
-  }
-  if (statusCode && statusCode >= 400) {
-    throw new Error(`${appActionId} failed (${statusCode}): ${typeof body === 'string' ? body : JSON.stringify(body)}`);
-  }
-  return body;
+  const byLocale = entry.fields?.[id];
+  return byLocale ? (Object.values(byLocale).find((v) => v != null) as T | undefined) : undefined;
 }
 
 // Copies every already-published entry of a content type into its just-linked Data Extension, so
-// linking isn't limited to entries published from that point forward.
+// linking isn't limited to entries published from that point forward. The Data Extension Rows
+// (Synchronous) API returns a final result in one round trip, so there's no poll counterpart.
 async function runBackfill(
   cma: CMAClient,
   ids: AppActionIds,
-  params: { contentTypeId: string; deExternalKey: string; pkContentfulFieldId: string; deFields: unknown[] },
+  params: { contentTypeId: string; deExternalKey: string; deMid: string; pkContentfulFieldId: string; deFields: unknown[] },
   onProgress?: (message: string) => void
-): Promise<{ totalEntries: number; totalRows: number; processed: number }> {
+): Promise<BackfillResult> {
   onProgress?.(`Copying existing ${params.contentTypeId} records into ${params.deExternalKey}...`);
-  const result = await callAppAction(cma, ids, 'backfillDeRows', {
+  const result = await callAppAction<BackfillResult>(cma, ids, 'backfillDeRows', {
     contentTypeId: params.contentTypeId,
     deExternalKey: params.deExternalKey,
     pkContentfulFieldId: params.pkContentfulFieldId,
     deFieldsJson: JSON.stringify(params.deFields ?? []),
+    ...(params.deMid ? { deMid: params.deMid } : {}),
   });
-  if (!result?.ok) throw new Error(result?.error || 'Backfill failed.');
-  return {
-    totalEntries: result.totalEntries ?? 0,
-    totalRows: result.totalRows ?? 0,
-    processed: result.processed ?? 0,
-  };
+  if (!result.ok) throw new Error(result.error || 'Backfill failed.');
+  return result;
 }
 
 function deFieldsOf(entry: EntryProps): DeField[] {
   return field<{ fields: DeField[] }>(entry, 'fieldMap')?.fields ?? [];
 }
 
-// Same eligibility rule as deriveDeFieldsFromContentType's filter — kept in sync by hand so the UI
-// checklist only ever offers fields the backend would actually derive.
+/** MID of the BU that owns a registry entry's DE; blank = the Installed Package's default BU. */
+function deMidOf(entry: EntryProps): string {
+  return field<string>(entry, 'businessUnitMid') ?? '';
+}
+
+function locationLabel(entry: EntryProps): string {
+  const mid = deMidOf(entry);
+  if (field<boolean>(entry, 'isShared')) return `Shared · parent BU${mid ? ` ${mid}` : ''}`;
+  return mid ? `BU ${mid}` : 'Default BU';
+}
+
+// Same eligibility rule as deriveDeFieldsFromContentType's filter, so the UI checklist only ever
+// offers fields the backend would actually derive.
 function isEligibleField(f: ContentTypeField): boolean {
-  return !f.disabled && !f.omitted && f.type !== 'Link' && f.type !== 'RichText';
+  return !f.disabled && !f.omitted && isSyncableField(f);
 }
 
 const Page = () => {
   const sdk = useSDK<PageAppSDK>();
   const cma = useCMA();
+  const locale = sdk.locales.default;
+  // Non-secret installation parameter, so the browser can read it.
+  const parentMid = String((sdk.parameters.installation as { MCE_PARENT_MID?: string })?.MCE_PARENT_MID ?? '').trim();
 
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -136,6 +97,8 @@ const Page = () => {
   const [contentTypes, setContentTypes] = useState<ContentTypeProps[]>([]);
   const [registryEntries, setRegistryEntries] = useState<EntryProps[]>([]);
   const [linkageEntries, setLinkageEntries] = useState<EntryProps[]>([]);
+  // Registry fields added after v1 exist only once the ConfigScreen has been saved on this version.
+  const [registryFieldIds, setRegistryFieldIds] = useState<Set<string>>(new Set());
 
   const [selectedContentTypeId, setSelectedContentTypeId] = useState<string | null>(null);
   const [selectedRegistryEntryId, setSelectedRegistryEntryId] = useState<string | null>(null);
@@ -164,7 +127,7 @@ const Page = () => {
     setError(null);
     try {
       const [ctRes, registryRes, linkageRes] = await Promise.all([
-        cma.contentType.getMany({}),
+        cma.contentType.getMany({ query: { limit: 1000 } }),
         cma.entry.getMany({
           query: { content_type: REGISTRY_CONTENT_TYPE, limit: 1000, 'sys.archivedAt[exists]': false },
         }),
@@ -173,6 +136,7 @@ const Page = () => {
         }),
       ]);
       setContentTypes(ctRes.items.filter((ct) => !ADMIN_CONTENT_TYPES.has(ct.sys.id)));
+      setRegistryFieldIds(new Set(ctRes.items.find((ct) => ct.sys.id === REGISTRY_CONTENT_TYPE)?.fields.map((f) => f.id) ?? []));
       setRegistryEntries(registryRes.items);
       setLinkageEntries(linkageRes.items);
     } catch (e) {
@@ -256,7 +220,7 @@ const Page = () => {
     setBackfillMessage(null);
     try {
       const linkField = {
-        'en-US': { sys: { type: 'Link', linkType: 'Entry', id: selectedRegistryEntryId } },
+        [locale]: { sys: { type: 'Link', linkType: 'Entry', id: selectedRegistryEntryId } },
       };
       let pkContentfulFieldId: string;
       if (existingLinkage) {
@@ -266,21 +230,22 @@ const Page = () => {
           fields: {
             ...existingLinkage.fields,
             dataExtension: linkField,
-            isActive: { 'en-US': true },
+            isActive: { [locale]: true },
           },
         };
         const saved = await cma.entry.update({ entryId: existingLinkage.sys.id }, updated);
         await cma.entry.publish({ entryId: saved.sys.id }, saved);
       } else {
-        pkContentfulFieldId = selectedContentType.displayField ?? 'internalName';
+        // Rows are keyed by entry id: a display field can be blank, repeat across entries or change.
+        pkContentfulFieldId = ENTRY_ID_SENTINEL;
         const created = await cma.entry.create(
           { contentTypeId: LINKAGE_CONTENT_TYPE },
           {
             fields: {
-              contentTypeId: { 'en-US': selectedContentTypeId },
-              pkContentfulFieldId: { 'en-US': pkContentfulFieldId },
+              contentTypeId: { [locale]: selectedContentTypeId },
+              pkContentfulFieldId: { [locale]: pkContentfulFieldId },
               dataExtension: linkField,
-              isActive: { 'en-US': true },
+              isActive: { [locale]: true },
             },
           }
         );
@@ -295,7 +260,7 @@ const Page = () => {
           const result = await runBackfill(
             cma,
             ids,
-            { contentTypeId: selectedContentTypeId, deExternalKey, pkContentfulFieldId, deFields: deFieldsOf(registryEntry) },
+            { contentTypeId: selectedContentTypeId, deExternalKey, deMid: deMidOf(registryEntry), pkContentfulFieldId, deFields: deFieldsOf(registryEntry) },
             setBackfillMessage
           );
           setBackfillMessage(`Linked. Copied ${result.processed} row(s) from ${result.totalEntries} entrie(s) into ${deExternalKey}.`);
@@ -330,7 +295,7 @@ const Page = () => {
       const result = await runBackfill(
         cma,
         ids,
-        { contentTypeId: selectedContentTypeId, deExternalKey, pkContentfulFieldId, deFields: deFieldsOf(registryEntry) },
+        { contentTypeId: selectedContentTypeId, deExternalKey, deMid: deMidOf(registryEntry), pkContentfulFieldId, deFields: deFieldsOf(registryEntry) },
         setBackfillMessage
       );
       setBackfillMessage(`Copied ${result.processed} row(s) from ${result.totalEntries} entrie(s) into ${deExternalKey}.`);
@@ -349,7 +314,7 @@ const Page = () => {
     try {
       const updated: EntryProps = {
         ...existingLinkage,
-        fields: { ...existingLinkage.fields, isActive: { 'en-US': false } },
+        fields: { ...existingLinkage.fields, isActive: { [locale]: false } },
       };
       const saved = await cma.entry.update({ entryId: existingLinkage.sys.id }, updated);
       await cma.entry.publish({ entryId: saved.sys.id }, saved);
@@ -386,22 +351,18 @@ const Page = () => {
 
   const handleCreateNetNewDe = async () => {
     if (!createContentTypeId || !sdk.ids.app) return;
-    const ids: AppActionIds = {
-      spaceId: sdk.ids.space,
-      environmentId: sdk.ids.environment,
-      appDefinitionId: sdk.ids.app,
-    };
+    const ids: AppActionIds = { spaceId: sdk.ids.space, environmentId: sdk.ids.environment, appDefinitionId: sdk.ids.app };
     setDeployBusy(true);
     setDeployError(null);
     try {
       const excludedFieldIds = createEligibleFields.filter((f) => !fieldSelection[f.id]).map((f) => f.id);
-      setDeployStatusMessage('Deriving schema and creating the Data Extension...');
-      const createResult = await callAppAction(cma, ids, 'createDataExtension', {
+      setDeployStatusMessage(parentMid ? `Creating a Shared Data Extension in parent BU ${parentMid}...` : 'Deriving schema and creating the Data Extension...');
+      const createResult = await callAppAction<CreateDataExtensionResult>(cma, ids, 'createDataExtension', {
         contentTypeId: createContentTypeId,
         extraFieldLabels: extraFieldLabels.trim() || undefined,
         excludedFieldIds: excludedFieldIds.length ? excludedFieldIds.join(',') : undefined,
       });
-      if (!createResult?.ok) throw new Error(createResult?.error || 'Failed to create the Data Extension.');
+      if (!createResult.ok) throw new Error(createResult.error || 'Failed to create the Data Extension.');
 
       setDeployStatusMessage(`Created ${createResult.deExternalKey}. Registering in Contentful...`);
 
@@ -409,19 +370,21 @@ const Page = () => {
         { contentTypeId: REGISTRY_CONTENT_TYPE },
         {
           fields: {
-            deLabel: { 'en-US': createResult.deLabel },
-            deExternalKey: { 'en-US': createResult.deExternalKey },
-            pkFieldApiName: { 'en-US': createResult.pkFieldApiName },
-            fieldMap: { 'en-US': { fields: createResult.fields } },
-            excludedFieldIds: { 'en-US': createResult.excludedFieldIds ?? [] },
-            deployStatus: { 'en-US': 'deployed' },
+            deLabel: { [locale]: createResult.deLabel },
+            deExternalKey: { [locale]: createResult.deExternalKey },
+            pkFieldApiName: { [locale]: createResult.pkFieldApiName },
+            fieldMap: { [locale]: { fields: createResult.fields } },
+            excludedFieldIds: { [locale]: createResult.excludedFieldIds ?? [] },
+            deployStatus: { [locale]: 'deployed' },
+            ...(registryFieldIds.has('businessUnitMid') ? { businessUnitMid: { [locale]: createResult.businessUnitMid } } : {}),
+            ...(registryFieldIds.has('isShared') ? { isShared: { [locale]: createResult.isShared } } : {}),
           },
         }
       );
       const publishedRegistry = await cma.entry.publish({ entryId: registryEntry.sys.id }, registryEntry);
 
       const linkField = {
-        'en-US': { sys: { type: 'Link', linkType: 'Entry', id: publishedRegistry.sys.id } },
+        [locale]: { sys: { type: 'Link', linkType: 'Entry', id: publishedRegistry.sys.id } },
       };
       const existing = linkageByContentType.get(createContentTypeId);
       if (existing) {
@@ -429,9 +392,9 @@ const Page = () => {
           ...existing,
           fields: {
             ...existing.fields,
-            pkContentfulFieldId: { 'en-US': ENTRY_ID_SENTINEL },
+            pkContentfulFieldId: { [locale]: ENTRY_ID_SENTINEL },
             dataExtension: linkField,
-            isActive: { 'en-US': true },
+            isActive: { [locale]: true },
           },
         };
         const saved = await cma.entry.update({ entryId: existing.sys.id }, updated);
@@ -441,10 +404,10 @@ const Page = () => {
           { contentTypeId: LINKAGE_CONTENT_TYPE },
           {
             fields: {
-              contentTypeId: { 'en-US': createContentTypeId },
-              pkContentfulFieldId: { 'en-US': ENTRY_ID_SENTINEL },
+              contentTypeId: { [locale]: createContentTypeId },
+              pkContentfulFieldId: { [locale]: ENTRY_ID_SENTINEL },
               dataExtension: linkField,
-              isActive: { 'en-US': true },
+              isActive: { [locale]: true },
             },
           }
         );
@@ -462,6 +425,7 @@ const Page = () => {
           {
             contentTypeId: createContentTypeId,
             deExternalKey: createResult.deExternalKey,
+            deMid: createResult.businessUnitMid,
             pkContentfulFieldId: ENTRY_ID_SENTINEL,
             deFields: createResult.fields,
           },
@@ -499,6 +463,8 @@ const Page = () => {
 
   // Preserves FIXED_FIELDS and any manually-added extra fields (identified by having no
   // contentfulFieldId) — only the content-type-derived slice is recomputed from the checklist.
+  // Newly checked fields get a column in the DE first (addDeFields), so the registry never maps a
+  // field the DE can't store; unchecked fields keep their column and simply stop being written.
   const handleSaveFieldSelection = async () => {
     if (!selectedContentType || !selectedContentTypeId || !existingRegistryEntry || !existingLinkage || !sdk.ids.app) return;
     setEditFieldsBusy(true);
@@ -511,26 +477,37 @@ const Page = () => {
       const derivedFields = deriveDeFieldsFromContentType(selectedContentType as unknown as ContentTypeLike, excludedFieldIds);
       const manualFields = deFieldsOf(existingRegistryEntry).filter((f) => !f.contentfulFieldId);
       const newFieldMap = [...manualFields, ...derivedFields];
+      const deExternalKey = field<string>(existingRegistryEntry, 'deExternalKey');
+      const deMid = deMidOf(existingRegistryEntry);
+      const ids: AppActionIds = { spaceId: sdk.ids.space, environmentId: sdk.ids.environment, appDefinitionId: sdk.ids.app };
+
+      if (deExternalKey) {
+        setEditFieldsMessage(`Updating the ${deExternalKey} schema...`);
+        const added = await callAppAction<{ added: string[] }>(cma, ids, 'addDeFields', {
+          deExternalKey,
+          deFieldsJson: JSON.stringify(newFieldMap),
+          ...(deMid ? { deMid } : {}),
+        });
+        if (!added.ok) throw new Error(added.error || 'Failed to update the Data Extension schema.');
+      }
 
       const updatedRegistry: EntryProps = {
         ...existingRegistryEntry,
         fields: {
           ...existingRegistryEntry.fields,
-          fieldMap: { 'en-US': { fields: newFieldMap } },
-          excludedFieldIds: { 'en-US': excludedFieldIds },
+          fieldMap: { [locale]: { fields: newFieldMap } },
+          excludedFieldIds: { [locale]: excludedFieldIds },
         },
       };
       const saved = await cma.entry.update({ entryId: existingRegistryEntry.sys.id }, updatedRegistry);
-      const published = await cma.entry.publish({ entryId: saved.sys.id }, saved);
+      await cma.entry.publish({ entryId: saved.sys.id }, saved);
 
-      const deExternalKey = field<string>(published, 'deExternalKey');
       const pkContentfulFieldId = field<string>(existingLinkage, 'pkContentfulFieldId') ?? ENTRY_ID_SENTINEL;
       if (deExternalKey) {
-        const ids: AppActionIds = { spaceId: sdk.ids.space, environmentId: sdk.ids.environment, appDefinitionId: sdk.ids.app };
         const result = await runBackfill(
           cma,
           ids,
-          { contentTypeId: selectedContentTypeId, deExternalKey, pkContentfulFieldId, deFields: newFieldMap },
+          { contentTypeId: selectedContentTypeId, deExternalKey, deMid, pkContentfulFieldId, deFields: newFieldMap },
           setEditFieldsMessage
         );
         setEditFieldsMessage(`Saved. Re-synced ${result.processed} row(s) from ${result.totalEntries} entrie(s).`);
@@ -561,6 +538,11 @@ const Page = () => {
           <Paragraph>
             Link Contentful content types to the Marketing Cloud Engagement Data Extensions they
             publish into. Select one content type and one registry entry, then Link.
+          </Paragraph>
+          <Paragraph fontColor="gray600">
+            {parentMid
+              ? `New Data Extensions are created as Shared Data Extensions in parent BU ${parentMid}, so they can be shared to child BUs.`
+              : "New Data Extensions are created in the Installed Package's default BU. Set the Parent BU MID on the configuration screen to create Shared Data Extensions instead."}
           </Paragraph>
         </Box>
         <Tooltip content="Create a brand-new Data Extension in Marketing Cloud Engagement, derived from a content type's fields, and link it.">
@@ -668,6 +650,7 @@ const Page = () => {
                 <Table.Cell>{''}</Table.Cell>
                 <Table.Cell>Label</Table.Cell>
                 <Table.Cell>External Key</Table.Cell>
+                <Table.Cell>Location</Table.Cell>
                 <Table.Cell>Deploy Status</Table.Cell>
               </Table.Row>
             </Table.Head>
@@ -685,6 +668,9 @@ const Page = () => {
                   </Table.Cell>
                   <Table.Cell>{field<string>(entry, 'deLabel')}</Table.Cell>
                   <Table.Cell>{field<string>(entry, 'deExternalKey')}</Table.Cell>
+                  <Table.Cell>
+                    <Text fontColor="gray600">{locationLabel(entry)}</Text>
+                  </Table.Cell>
                   <Table.Cell>
                     <Badge variant={field<string>(entry, 'deployStatus') === 'deployed' ? 'positive' : 'warning'}>
                       {field<string>(entry, 'deployStatus')}
@@ -745,6 +731,17 @@ const Page = () => {
                 derived from the selected content type, and links it here. Only newly-created Data
                 Extensions can be linked this way — existing DEs must be linked via the tables above.
               </Paragraph>
+              {parentMid ? (
+                <Note variant="neutral" style={{ marginBottom: 16 }}>
+                  Created as a Shared Data Extension in parent BU {parentMid}, under Shared Data Extensions › Contentful. Child BUs reference
+                  it as <code>ENT.&lt;name&gt;</code>. Choose which child BUs can see it in Marketing Cloud (Shared Data Extensions folder ›
+                  sharing settings); this app doesn&apos;t change sharing.
+                </Note>
+              ) : (
+                <Note variant="neutral" style={{ marginBottom: 16 }}>
+                  Created in the Installed Package&apos;s default BU, under Data Extensions › Contentful. It won&apos;t be visible to other BUs.
+                </Note>
+              )}
               <FormControl>
                 <FormControl.Label>Content Type</FormControl.Label>
                 <Select
@@ -792,8 +789,8 @@ const Page = () => {
                     ))}
                   </Box>
                   <FormControl.HelpText>
-                    Unchecked fields are left out of the Data Extension's schema (Link and Rich
-                    Text fields aren't eligible and aren't listed here).
+                    Unchecked fields are left out of the Data Extension's schema (Link, Rich Text,
+                    JSON and Location fields aren't eligible and aren't listed here).
                   </FormControl.HelpText>
                 </FormControl>
               )}
@@ -845,6 +842,7 @@ const Page = () => {
               <Paragraph>
                 Choose which fields of this content type sync into the linked Data Extension.
                 Saving recomputes the field map and re-copies every already-published entry.
+                Newly checked fields are added to the Data Extension as columns; unchecked fields keep their column but stop being written.
                 Bookkeeping columns and any manually-added extra fields are kept as-is.
               </Paragraph>
               {selectedContentType && (

@@ -4,7 +4,8 @@
  * link exists. Fetches every published entry of the content type via the CMA (already available on
  * `context.cma`, no CDA token needed), maps each to DE row-upsert items with the same
  * mapEntryToDeRows used by the runtime sync path, and POSTs them in chunks to the Data Extension
- * Rows (Synchronous) rowset endpoint.
+ * Rows (Synchronous) rowset endpoint. Rows are written with a token for the BU that owns the DE
+ * (`deMid`) — for a Shared Data Extension that's the parent BU.
  *
  * Unlike the Marketing-Object-sync app's backfill (an async Bulk API 2.0 job needing a start/poll
  * split), this REST endpoint is genuinely synchronous — the whole backfill runs to completion in
@@ -13,7 +14,7 @@
  * addressed here.
  */
 import type { AppActionRequest, FunctionEventContext, FunctionEventHandler, FunctionTypeEnum } from '@contentful/node-apps-toolkit';
-import { readMceCreds, getMceToken, joinUrl } from './lib/mceAuth';
+import { readMceCreds, getMceToken, joinUrl, missingCredsError } from './lib/mceAuth';
 import { mapEntryToDeRows, type ContentTypeLike, type DeField, type DeRowItem } from './lib/deFieldMapping';
 
 const PAGE_SIZE = 100;
@@ -24,6 +25,8 @@ type StartBackfillBody = {
   deExternalKey: string;
   pkContentfulFieldId: string;
   deFieldsJson?: string;
+  /** MID of the BU that owns the DE (the parent BU for Shared DEs); blank = the package's default BU. */
+  deMid?: string;
 };
 
 export const handler: FunctionEventHandler<FunctionTypeEnum.AppActionCall> = async (
@@ -36,9 +39,8 @@ export const handler: FunctionEventHandler<FunctionTypeEnum.AppActionCall> = asy
   }
 
   const creds = readMceCreds(context);
-  if (!creds.authBaseUrl || !creds.restBaseUrl || !creds.clientId || !creds.clientSecret) {
-    return { ok: false, error: 'Marketing Cloud Engagement credentials are not configured on this app installation.' };
-  }
+  const credsError = missingCredsError(creds, ['rest']);
+  if (credsError) return { ok: false, error: credsError };
 
   const cma = context.cma;
   if (!cma) return { ok: false, error: 'CMA client is not available in this function context.' };
@@ -73,7 +75,7 @@ export const handler: FunctionEventHandler<FunctionTypeEnum.AppActionCall> = asy
     for (const entry of page.items) {
       if (entry.sys.publishedVersion == null) continue; // draft-only entries have nothing live to copy
       totalEntries += 1;
-      items.push(...mapEntryToDeRows(entry as any, contentType, deFields, body.pkContentfulFieldId));
+      items.push(...mapEntryToDeRows(entry as unknown as Parameters<typeof mapEntryToDeRows>[0], contentType, deFields, body.pkContentfulFieldId));
     }
     if (page.items.length < PAGE_SIZE) break;
     skip += PAGE_SIZE;
@@ -85,7 +87,7 @@ export const handler: FunctionEventHandler<FunctionTypeEnum.AppActionCall> = asy
 
   let token;
   try {
-    token = await getMceToken(creds);
+    token = await getMceToken(creds, body.deMid);
   } catch (err) {
     return { ok: false, error: `Marketing Cloud Engagement auth failed: ${(err as Error).message}` };
   }
